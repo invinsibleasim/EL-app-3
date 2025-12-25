@@ -1,5 +1,5 @@
 streamlit
 torch>=1.8
-opencv-python-headless>=4.8.0
+opencv-python-headless
 numpy>=1.23
 pandas>=2.0
