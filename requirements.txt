@@ -1,8 +1,10 @@
 streamlit
 torch>=1.8
 opencv-python-headless
-numpy>=1.23
-pandas>=2.0
-tqdm
-matplotlib
 seaborn
+# Add other dependencies here, e.g.,
+#pandas
+matplotlib
+numpy
+pandas
+tqdm
