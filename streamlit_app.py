@@ -1,66 +1,75 @@
-# el_yolov5_infer.py
+# app_el_yolov5_streamlit.py
 """
-YOLOv5 object detection for PV electroluminescence (EL) defects using a custom best.pt.
-- Supports images and videos.
-- Adjustable confidence/IoU thresholds.
-- Saves annotated outputs and CSV of detections.
-- Optional CLAHE contrast enhancement for EL grayscale images.
+Streamlit front-end for YOLOv5 object detection on PV Electroluminescence (EL) images and videos
+using your custom `best.pt`.
 
-Usage examples:
-  python el_yolov5_infer.py --weights best.pt --source path/to/el_image.jpg --conf 0.30 --iou 0.45 --clahe
-  python el_yolov5_infer.py --weights best.pt --source path/to/el_video.mp4 --conf 0.30 --iou 0.45 --classes 0 1 2
+Features
+- Upload or path-select your YOLOv5 `best.pt` weights
+- Image & video inference
+- Adjustable confidence & IoU thresholds
+- Optional class filter
+- Optional CLAHE contrast enhancement for EL images
+- Download annotated PNG/MP4 and detections CSV/JSON
 
-Notes:
-- This script uses PyTorch Hub to load Ultralytics YOLOv5 with custom weights.
-- Make sure your best.pt was trained in the ultralytics/yolov5 repo.
+Note
+- This app loads YOLOv5 via PyTorch Hub (`ultralytics/yolov5`) and then your custom weights.
+- Ensure your `best.pt` was trained with the original Ultralytics YOLOv5 repository.
 """
 
-import argparse
+import io
 import os
 from pathlib import Path
-import json
+from typing import Dict, List, Optional
 
-import cv2
+import streamlit as st
 import numpy as np
+import pandas as pd
+from PIL import Image
+import cv2
 import torch
 
-# ---------------------------
-# Utilities
-# ---------------------------
+# ------------------------------
+# Helpers
+# ------------------------------
+
+@st.cache_resource(show_spinner=False)
+def load_yolov5_model(weights_path: str):
+    """Load custom YOLOv5 model via PyTorch Hub and cache it.
+    weights_path: path to best.pt
+    """
+    # Load model from Ultralytics YOLOv5 hub with custom weights
+    model = torch.hub.load('ultralytics/yolov5', 'custom', path=weights_path, force_reload=False)
+    return model
+
 
 def ensure_rgb(img_bgr: np.ndarray, apply_clahe: bool = False) -> np.ndarray:
-    """Ensure 3-channel RGB input; apply CLAHE if requested.
-    EL images are often grayscale; YOLOv5 expects 3-channel RGB.
-    """
+    """Ensure 3-channel RGB; apply CLAHE for EL contrast enhancement if requested."""
     if img_bgr is None:
         raise ValueError("Failed to read image")
-    # Detect grayscale
-    if len(img_bgr.shape) == 2 or img_bgr.shape[2] == 1:
-        gray = img_bgr if len(img_bgr.shape) == 2 else img_bgr[..., 0]
+    if len(img_bgr.shape) == 2 or (img_bgr.ndim == 3 and img_bgr.shape[2] == 1):
+        gray = img_bgr if img_bgr.ndim == 2 else img_bgr[..., 0]
         if apply_clahe:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         return rgb
-    else:
-        # BGR -> RGB
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        if apply_clahe:
-            # Convert to HSV, boost V with CLAHE
-            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-            v = hsv[..., 2]
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            hsv[..., 2] = clahe.apply(v)
-            rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-        return rgb
+    # BGR -> RGB
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    if apply_clahe:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        v = hsv[..., 2]
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        hsv[..., 2] = clahe.apply(v)
+        rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    return rgb
 
 
-def draw_boxes(img_rgb: np.ndarray, df) -> np.ndarray:
-    """Draw bounding boxes from results.pandas().xyxy[0] dataframe."""
+def draw_boxes(img_rgb: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+    """Draw bounding boxes from YOLOv5 results dataframe."""
     img = img_rgb.copy()
     for _, row in df.iterrows():
         x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
-        conf = row.get('confidence', 0.0)
+        conf = float(row.get('confidence', 0.0))
         name = str(row.get('name', row.get('class', 'obj')))
         color = (0, 255, 0)
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
@@ -71,104 +80,186 @@ def draw_boxes(img_rgb: np.ndarray, df) -> np.ndarray:
     return img
 
 
-def save_results(out_dir: Path, stem: str, df, annotated_rgb: np.ndarray):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Save annotated image
-    out_img = out_dir / f"{stem}_annotated.jpg"
-    cv2.imwrite(str(out_img), cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR))
-    # Save CSV
-    out_csv = out_dir / f"{stem}_detections.csv"
-    df.to_csv(out_csv, index=False)
-    # Save JSON
-    out_json = out_dir / f"{stem}_detections.json"
-    with open(out_json, 'w') as f:
-        json.dump(df.to_dict(orient='records'), f, indent=2)
+def df_download_buttons(df: pd.DataFrame, stem: str):
+    csv = df.to_csv(index=False).encode('utf-8')
+    json_str = df.to_json(orient='records', indent=2)
+    st.download_button(
+        label=f"⬇️ Download detections CSV ({stem})",
+        data=csv,
+        file_name=f"{stem}_detections.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        label=f"⬇️ Download detections JSON ({stem})",
+        data=json_str,
+        file_name=f"{stem}_detections.json",
+        mime="application/json",
+    )
 
 
-# ---------------------------
-# Main
-# ---------------------------
+# ------------------------------
+# Streamlit UI
+# ------------------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--weights', type=str, required=True, help='Path to best.pt')
-    ap.add_argument('--source', type=str, required=True, help='Image or video path')
-    ap.add_argument('--conf', type=float, default=0.25, help='Confidence threshold')
-    ap.add_argument('--iou', type=float, default=0.45, help='IoU threshold')
-    ap.add_argument('--imgsz', type=int, default=640, help='Inference image size')
-    ap.add_argument('--classes', nargs='*', type=int, default=None, help='Optional class indices to filter')
-    ap.add_argument('--clahe', action='store_true', help='Apply CLAHE contrast enhancement')
-    ap.add_argument('--out', type=str, default='runs/el_detect', help='Output directory')
-    args = ap.parse_args()
+st.set_page_config(page_title="YOLOv5 EL Defect Detection", page_icon="🔧", layout="wide")
+st.title("🛠️ YOLOv5 Object Detection for PV EL Defects")
+st.caption("Upload your `best.pt` and EL images/videos. Configure thresholds, class filters, and CLAHE for contrast.")
 
-    weights = args.weights
-    source = args.source
-    out_dir = Path(args.out)
+st.sidebar.header("⚙️ Configuration")
+# Weights: upload or path
+w_choice = st.sidebar.radio("Select weights source", ["Upload best.pt", "Use local path"], index=0)
+weights_path = None
+if w_choice == "Upload best.pt":
+    w_file = st.sidebar.file_uploader("Upload best.pt", type=["pt"], accept_multiple_files=False)
+    if w_file:
+        tmp_w = Path("best_uploaded.pt")
+        tmp_w.write_bytes(w_file.read())
+        weights_path = str(tmp_w)
+else:
+    weights_path = st.sidebar.text_input("Local path to best.pt", value="best.pt")
 
-    # Load custom YOLOv5 model via PyTorch Hub
-    model = torch.hub.load('ultralytics/yolov5', 'custom', path=weights, force_reload=False)
-    model.conf = args.conf  # confidence
-    model.iou = args.iou    # nms iou
-    model.classes = args.classes  # class filter
+conf = st.sidebar.slider("Confidence threshold", 0.0, 1.0, 0.30, 0.01)
+iou = st.sidebar.slider("IoU threshold (NMS)", 0.1, 1.0, 0.45, 0.01)
+imgsz = st.sidebar.number_input("Image size (inference)", min_value=320, max_value=1280, value=640, step=64)
+clahe = st.sidebar.checkbox("Apply CLAHE (contrast boost for EL)", value=True)
+class_filter = st.sidebar.text_input("Filter by class indices (comma-separated, optional)", value="")
 
-    if not os.path.exists(source):
-        raise FileNotFoundError(f"Source not found: {source}")
+# Load model
+if weights_path:
+    with st.spinner("Loading YOLOv5 model…"):
+        try:
+            model = load_yolov5_model(weights_path)
+            model.conf = conf
+            model.iou = iou
+            if class_filter.strip():
+                model.classes = [int(x.strip()) for x in class_filter.split(',') if x.strip().isdigit()]
+            else:
+                model.classes = None
+            names = getattr(model, 'names', None)
+            st.success("Model loaded.")
+        except Exception as e:
+            st.error(f"Failed to load model: {e}")
+            st.stop()
+else:
+    st.info("Upload or enter path to your `best.pt` to continue.")
+    st.stop()
 
-    # Image path
-    if any(source.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp']):
-        bgr = cv2.imread(source, cv2.IMREAD_UNCHANGED)
-        rgb = ensure_rgb(bgr, apply_clahe=args.clahe)
-        # Inference (accepts numpy RGB)
-        results = model(rgb, size=args.imgsz)
-        df = results.pandas().xyxy[0]
+# Tabs for image and video
+img_tab, vid_tab = st.tabs(["🖼️ Image", "🎥 Video"])
+
+# ------------------------------
+# Image tab
+# ------------------------------
+with img_tab:
+    st.subheader("Image Inference")
+    img_file = st.file_uploader("Upload EL image", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"])
+    cam_img = st.camera_input("Or capture from webcam (optional)")
+
+    source_image = None
+    stem = None
+    if img_file is not None:
+        source_image = Image.open(img_file).convert("RGB")  # PIL
+        stem = Path(img_file.name).stem
+    elif cam_img is not None:
+        source_image = Image.open(cam_img).convert("RGB")
+        stem = "webcam_capture"
+
+    if source_image is not None:
+        st.image(source_image, caption="Input", use_column_width=True)
+        # Convert PIL to numpy BGR for preprocessing then back to RGB
+        bgr = cv2.cvtColor(np.array(source_image), cv2.COLOR_RGB2BGR)
+        rgb = ensure_rgb(bgr, apply_clahe=clahe)
+
+        with st.spinner("Running detection…"):
+            results = model(rgb, size=int(imgsz))
+            df = results.pandas().xyxy[0]
         annotated = draw_boxes(rgb, df)
-        save_results(out_dir, Path(source).stem, df, annotated)
-        print(f"Saved to {out_dir}")
-        return
+        st.image(annotated, caption="Annotated", use_column_width=True)
 
-    # Video path
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        raise ValueError(f"Failed to open video: {source}")
+        st.write("### Detections")
+        st.dataframe(df)
+        df_download_buttons(df, stem or "image")
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_video = out_dir / f"{Path(source).stem}_annotated.mp4"
-    out_dir.mkdir(parents=True, exist_ok=True)
+        # Download annotated image
+        ann_pil = Image.fromarray(annotated)
+        buf = io.BytesIO()
+        ann_pil.save(buf, format="PNG")
+        st.download_button(
+            label="⬇️ Download annotated image (PNG)",
+            data=buf.getvalue(),
+            file_name=f"{(stem or 'image')}_annotated.png",
+            mime="image/png",
+        )
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(str(out_video), fourcc, fps, (w, h))
+# ------------------------------
+# Video tab
+# ------------------------------
+with vid_tab:
+    st.subheader("Video Inference")
+    vid_file = st.file_uploader("Upload EL video", type=["mp4", "avi", "mov", "mkv"])
+    frame_skip = st.number_input("Frame skip (process every Nth frame)", min_value=1, max_value=20, value=1)
 
-    frame_idx = 0
-    all_rows = []
-    while True:
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
-        frame_idx += 1
-        rgb = ensure_rgb(frame_bgr, apply_clahe=args.clahe)
-        results = model(rgb, size=args.imgsz)
-        df = results.pandas().xyxy[0]
-        df['frame'] = frame_idx
-        all_rows.append(df)
-        annotated = draw_boxes(rgb, df)
-        writer.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
-    cap.release()
-    writer.release()
+    if vid_file is not None:
+        temp_video_path = Path("temp_input_el_video")
+        temp_video_path.write_bytes(vid_file.read())
+        cap = cv2.VideoCapture(str(temp_video_path))
+        if not cap.isOpened():
+            st.error("Failed to open video.")
+        else:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_path = Path("el_annotated_output.mp4")
+            writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
 
-    if all_rows:
-        df_all = all_rows[0].iloc[0:0].copy()
-        df_all = json.loads(json.dumps(pd.concat(all_rows, ignore_index=True).to_dict(orient='records')))
-        # Save as CSV and JSON
-        import pandas as pd
-        df_cat = pd.concat(all_rows, ignore_index=True)
-        df_cat.to_csv(out_dir / f"{Path(source).stem}_detections.csv", index=False)
-        with open(out_dir / f"{Path(source).stem}_detections.json", 'w') as f:
-            json.dump(df_cat.to_dict(orient='records'), f, indent=2)
-    print(f"Saved to {out_dir}")
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            progress = st.progress(0.0, text="Processing video…")
+            all_rows: List[pd.DataFrame] = []
+            frame_idx = 0
+            while True:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
+                if frame_idx % int(frame_skip) != 0:
+                    continue
+                rgb = ensure_rgb(frame_bgr, apply_clahe=clahe)
+                results = model(rgb, size=int(imgsz))
+                df = results.pandas().xyxy[0]
+                df['frame'] = frame_idx
+                all_rows.append(df)
+                annotated = draw_boxes(rgb, df)
+                writer.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                if total_frames:
+                    progress.progress(min(frame_idx / total_frames, 1.0), text=f"Frame {frame_idx}/{total_frames}")
 
+            cap.release()
+            writer.release()
+            st.success("Video processed.")
+            st.video(str(out_path))
 
-if __name__ == '__main__':
-    main()
+            # Aggregate detections
+            if all_rows:
+                df_cat = pd.concat(all_rows, ignore_index=True)
+                st.write("### Detections (aggregated)")
+                st.dataframe(df_cat.head(500))  # show preview
+                df_download_buttons(df_cat, Path(vid_file.name).stem)
+                # Download annotated video
+                with open(out_path, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Download annotated video (MP4)",
+                        data=f.read(),
+                        file_name=f"{Path(vid_file.name).stem}_annotated.mp4",
+                        mime="video/mp4",
+                    )
 
+st.markdown(
+    """
+    ---
+    **Notes**
+    - This app uses PyTorch Hub to load Ultralytics YOLOv5 and your custom weights.
+    - CLAHE improves visibility of faint EL defects; disable if your training already includes contrast normalization.
+    - Class filter expects indices (e.g., `0,2,3`). Model class names come from your checkpoint.
+    """
+)
