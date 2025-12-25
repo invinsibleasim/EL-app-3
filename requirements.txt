@@ -1,6 +1,7 @@
 streamlit
+ultralytics
 torch>=1.8
 opencv-python-headless
 numpy>=1.23
 pandas>=2.0
-ultralytics
+
