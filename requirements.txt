@@ -1,4 +1,4 @@
-streamlit
+ultralytics
 #torch>=1.8
 #opencv-python-headless
 #seaborn
