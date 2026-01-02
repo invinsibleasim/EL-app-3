@@ -9,15 +9,27 @@
 #pandas
 #tqdm
 
-torch>=1.8
-streamlit>=1.31.0
-opencv-python-headless>=4.8.0
-pillow>=10.0.0
-pandas>=2.0.0
-numpy>=1.24.0
+#torch>=1.8
+#streamlit>=1.31.0
+#opencv-python-headless>=4.8.0
+#pillow>=10.0.0
+#pandas>=2.0.0
+#numpy>=1.24.0
 
 # Add plotting & utilities often imported by yolov5
-matplotlib>=3.7.0
-seaborn>=0.12.0
+#matplotlib>=3.7.0
+#seaborn>=0.12.0
+
+streamlit==1.39.0
+ultralytics==8.3.39
+
+# CPU-only Torch wheels (no CUDA)
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+Pillow==10.3.0
+
 requests>=2.31.0
 tqdm>=4.66.0
