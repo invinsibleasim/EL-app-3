@@ -1,11 +1,10 @@
 
 import os
-import io
 import time
-from pathlib import Path
-import tempfile
 import json
 import warnings
+import tempfile
+from pathlib import Path
 
 import streamlit as st
 import torch
@@ -13,13 +12,25 @@ import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
+import textwrap
+import traceback
 
 #############################
-# Utility & Model Loading   #
+# Helpers & Utilities       #
 #############################
+
+def fmt_err(prefix, e):
+    """Return a robust multi-line error message."""
+    return textwrap.dedent(f"""
+        {prefix}
+        Original error: {repr(e)}
+        Traceback (most recent call last):
+        {traceback.format_exc()}
+    """)
+
 
 def save_uploaded_file(uploaded_file, suffix=""):
-    """Save an uploaded file to a temporary location and return the path."""
+    """Save an uploaded file to a temporary location and return its path."""
     tmp_dir = tempfile.mkdtemp()
     filename = uploaded_file.name
     path = os.path.join(tmp_dir, f"{Path(filename).stem}{suffix}{Path(filename).suffix}")
@@ -29,10 +40,10 @@ def save_uploaded_file(uploaded_file, suffix=""):
 
 
 def parse_selected_classes(selected_names, model_names):
-    """Map selected class names to indices."""
-    if selected_names is None or len(selected_names) == 0:
+    """Map selected class names to indices for YOLOv5 'model.classes'."""
+    if not selected_names:
         return None
-    # Build name->index map
+    # Build name->index map from model.names (dict or list)
     if isinstance(model_names, dict):
         name_to_idx = {v: k for k, v in model_names.items()}
     else:
@@ -56,35 +67,36 @@ def load_yolov5_model(weights_path, repo_dir=None, device=None):
         else:
             model = torch.hub.load("ultralytics/yolov5", "custom", path=weights_path, trust_repo=True)
     except Exception as e:
-        raise RuntimeError(
-            "Failed to load YOLOv5 model. If offline, set 'YOLOv5 repo (local)' to a local clone."
-            f"Original error: {e}"
-        )
+        raise RuntimeError(fmt_err(
+            "Failed to load YOLOv5 model. If offline, set 'YOLOv5 repo (local)' to a local clone.", e
+        ))
     model.to(dev)
     model.eval()
     return model, dev
 
 
-def run_inference_on_image(model, img_path, out_dir, imgsz):
-    """Run inference and save annotated image + CSV."""
+def run_inference_on_image(model, img_path, out_dir, imgsz, out_ext="jpg"):
+    """Run inference and save annotated image (jpg/png) + CSV of detections."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     results = model(str(img_path), size=int(imgsz))
 
-    # Save annotated image
+    # Render annotated image (bounding boxes) and save with chosen extension
     try:
-        results.save(save_dir=str(out_dir))
-    except TypeError:
-        # Fallback manual render
-        results.render()
-        im = results.ims[0]  # BGR np array
+        results.render()  # modifies results.ims in-place (BGR numpy arrays)
+        im_bgr = results.ims[0]
         stem = Path(img_path).stem
-        out_path = out_dir / f"{stem}.jpg"
-        cv2.imwrite(str(out_path), im)
+        # enforce supported extensions
+        ext = ".png" if str(out_ext).lower() == "png" else ".jpg"
+        out_img_path = out_dir / f"{stem}{ext}"
+        cv2.imwrite(str(out_img_path), im_bgr)
+    except Exception as e:
+        warnings.warn(f"Could not render/save annotated image: {e}")
 
-    # Save CSV
+    # Save CSV of detections
     try:
-        df = results.pandas().xyxy[0]
+        df = results.pandas().xyxy[0]  # xmin, ymin, xmax, ymax, confidence, class, name
         stem = Path(img_path).stem
         (out_dir / f"{stem}.csv").write_text(df.to_csv(index=False))
     except Exception as e:
@@ -101,8 +113,8 @@ st.set_page_config(page_title="EL Defect Detection (YOLOv5)", layout="wide")
 
 st.title("EL Defect Detection using YOLOv5 (best.pt)")
 st.write(
-    "Upload EL images and a trained YOLOv5 weights file (best.pt). Configure confidence, IOU, and classes, "
-    "then run detection. Annotated images and CSVs will be saved to an output folder."
+    "Upload EL images and a trained YOLOv5 weights file (best.pt). Configure confidence, IOU, classes, and output format, "
+    "then run detection. Annotated images (JPG/PNG with bounding boxes) and CSVs will be saved to a run folder."
 )
 
 with st.sidebar:
@@ -125,6 +137,7 @@ with st.sidebar:
     agnostic_nms = st.checkbox("Agnostic NMS", value=False)
 
     out_root = st.text_input("Output root folder", value="./runs/el_streamlit")
+    out_ext = st.radio("Output image format", options=["jpg", "png"], index=0)
 
 st.divider()
 
@@ -136,7 +149,6 @@ uploaded_images = st.file_uploader(
 run_btn = st.button("Run Detection", type="primary")
 
 model = None
-model_names = None
 model_device = None
 weights_path = None
 
@@ -147,7 +159,7 @@ if run_btn:
     if weights_path is None:
         st.error("Please upload a YOLOv5 weights file (best.pt) to proceed.")
         st.stop()
-    if uploaded_images is None or len(uploaded_images) == 0:
+    if not uploaded_images:
         st.error("Please upload at least one EL image.")
         st.stop()
 
@@ -158,9 +170,10 @@ if run_btn:
         with st.spinner("Loading YOLOv5 model..."):
             model, model_device = load_yolov5_model(weights_path, repo_arg, device_arg)
     except Exception as e:
-        st.error(str(e))
+        st.error(fmt_err("Loading YOLOv5 model failed.", e))
         st.stop()
 
+    # Set thresholds & options
     model.conf = float(conf_thres)
     model.iou = float(iou_thres)
     model.max_det = int(max_det)
@@ -168,7 +181,7 @@ if run_btn:
 
     st.success(f"Model loaded on device: {model_device}")
 
-    # Class selection UI
+    # Class selection UI (after model is loaded so we can read model.names)
     model_names = model.names
     if isinstance(model_names, dict):
         cls_display = [model_names[i] for i in sorted(model_names.keys())]
@@ -176,6 +189,9 @@ if run_btn:
         cls_display = list(model_names)
     selected_cls_names = st.multiselect("Select classes to detect (optional)", options=cls_display)
     selected_cls_indices = parse_selected_classes(selected_cls_names, model_names)
+
+    # Apply class filter
+    model.classes = selected_cls_indices if selected_cls_indices is not None else None
 
     # Prepare output directory
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -194,11 +210,9 @@ if run_btn:
         "agnostic_nms": agnostic_nms,
         "selected_classes": selected_cls_names,
         "out_dir": str(out_dir),
+        "out_ext": out_ext,
     }
     (out_dir / "run_config.json").write_text(json.dumps(cfg, indent=2))
-
-    # Apply class filter to model
-    model.classes = selected_cls_indices if selected_cls_indices is not None else None
 
     # Process images
     cols = st.columns(2)
@@ -206,27 +220,29 @@ if run_btn:
 
     results_summary = []
     for i, upl in enumerate(uploaded_images):
-        st.write("")
         with st.spinner(f"Processing image {i+1}/{len(uploaded_images)}: {upl.name}"):
             img_path = save_uploaded_file(upl, suffix="")
-            res = run_inference_on_image(model, img_path, out_dir, imgsz=int(imgsz))
+            try:
+                res = run_inference_on_image(model, img_path, out_dir, imgsz=int(imgsz), out_ext=out_ext)
+            except Exception as e:
+                st.error(fmt_err(f"Inference failed for {upl.name}.", e))
+                continue
 
-            # Display annotated image if present
+            # Try to locate the saved annotated image
             stem = Path(img_path).stem
-            annotated_path = None
-            # YOLOv5 saves annotated image under out_dir / original_filename
-            candidate = Path(out_dir) / upl.name
-            if candidate.exists():
-                annotated_path = candidate
-            else:
-                # fallback: stem.jpg
-                alt = Path(out_dir) / f"{stem}.jpg"
-                if alt.exists():
-                    annotated_path = alt
-
-            if annotated_path and annotated_path.exists():
-                img = Image.open(annotated_path)
-                left.image(img, caption=f"Annotated: {upl.name}", use_column_width=True)
+            annotated_path = Path(out_dir) / f"{stem}.{out_ext}"
+            if annotated_path.exists():
+                try:
+                    img = Image.open(annotated_path)
+                    left.image(img, caption=f"Annotated: {upl.name}", use_column_width=True)
+                except Exception:
+                    # fallback: display via cv2
+                    im_bgr = cv2.imread(str(annotated_path))
+                    if im_bgr is not None:
+                        im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
+                        left.image(im_rgb, caption=f"Annotated: {upl.name}", use_column_width=True)
+                    else:
+                        st.warning("Annotated image could not be opened for preview.")
             else:
                 st.warning("Annotated image not found; check output folder.")
 
@@ -238,7 +254,12 @@ if run_btn:
             except Exception as e:
                 st.warning(f"No detections table available: {e}")
 
+    # Summary & download
     st.success(f"Completed. Outputs saved to: {out_dir}")
+
+    if results_summary:
+        st.subheader("Detection summary")
+        st.table(pd.DataFrame(results_summary))
 
     # Zip download
     try:
@@ -253,10 +274,5 @@ if run_btn:
                 mime="application/zip",
             )
     except Exception as e:
-        st.warning(f"Could not create ZIP: {e}")
-
-    # Summary
-    if results_summary:
-        st.subheader("Detection summary")
-        st.table(pd.DataFrame(results_summary))
+        st.warning(fmt_err("Could not create ZIP archive for outputs.", e))
 
