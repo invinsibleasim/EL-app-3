@@ -189,8 +189,8 @@ def main():
             video_input(data_src)
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        pass
+#if __name__ == "__main__":
+   # try:
+     #   main()
+    #except SystemExit:
+       # pass
