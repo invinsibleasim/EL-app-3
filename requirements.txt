@@ -19,21 +19,32 @@
 #streamlit
 
 # Base requirements from the official YOLOv5 repo
-matplotlib>=3.2.2
-numpy>=1.18.5
-opencv-python-headless # Use opencv-python-headless for server/cloud deployment
-Pillow>=7.1.2
-PyYAML>=5.3.1
-requests>=2.23.0
-scipy>=1.4.1
-torch>=1.7.0
-torchvision>=0.8.1
-tqdm>=4.41.0
-protobuf<4.21.5
+#matplotlib>=3.2.2
+#numpy>=1.18.5
+#opencv-python-headless # Use opencv-python-headless for server/cloud deployment
+#Pillow>=7.1.2
+#PyYAML>=5.3.1
+#requests>=2.23.0
+#scipy>=1.4.1
+#torch>=1.7.0
+#torchvision>=0.8.1
+#tqdm>=4.41.0
+#protobuf<4.21.5
 
 # Plotting requirements
-pandas>=1.1.4
-seaborn>=0.11.0
-
+#pandas>=1.1.4
+#seaborn>=0.11.0
+#
 # Streamlit requirement
+#streamlit
+
 streamlit
+torch>=1.8
+opencv-python-headless
+seaborn
+# Add other dependencies here, e.g.,
+#pandas
+matplotlib
+numpy
+pandas
+tqdm
