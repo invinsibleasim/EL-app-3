@@ -9,7 +9,7 @@ import time
 
 st.set_page_config(layout="wide")
 
-cfg_model_path = 'models/best.pt'
+cfg_model_path = 'model/best.pt'
 model = None
 confidence = .25
 
