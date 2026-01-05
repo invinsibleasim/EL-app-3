@@ -57,8 +57,7 @@ def load_yolov5_model(weights_path, repo_dir=None, device=None):
             model = torch.hub.load("ultralytics/yolov5", "custom", path=weights_path, trust_repo=True)
     except Exception as e:
         raise RuntimeError(
-            "Failed to load YOLOv5 model. If offline, set 'YOLOv5 repo (local)' to a local clone.
-"
+            "Failed to load YOLOv5 model. If offline, set 'YOLOv5 repo (local)' to a local clone."
             f"Original error: {e}"
         )
     model.to(dev)
