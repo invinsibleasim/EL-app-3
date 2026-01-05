@@ -1,327 +1,263 @@
 
 import os
 import io
-import glob
 import time
-import json
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+import tempfile
+import json
+import warnings
 
+import streamlit as st
+import torch
 import cv2
 import numpy as np
-import streamlit as st
+import pandas as pd
 from PIL import Image
 
-# ---------------------------
-# App config
-# ---------------------------
-st.set_page_config(page_title="Object Recognition Dashboard", layout="wide")
-st.title("🔍 Object Recognition Dashboard (YOLO)")
+#############################
+# Utility & Model Loading   #
+#############################
 
-# Ensure dirs exist
-for d in ["models", "data/uploaded_data", "data/sample_images", "data/sample_videos", "output", "tmp"]:
-    Path(d).mkdir(parents=True, exist_ok=True)
+def save_uploaded_file(uploaded_file, suffix=""):
+    """Save an uploaded file to a temporary location and return the path."""
+    tmp_dir = tempfile.mkdtemp()
+    filename = uploaded_file.name
+    path = os.path.join(tmp_dir, f"{Path(filename).stem}{suffix}{Path(filename).suffix}")
+    with open(path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return path
 
-# ---------------------------
-# Try Ultralytics (preferred)
-# ---------------------------
-ULTRA_AVAILABLE = False
-try:
-    from ultralytics import YOLO  # supports v5/v8/v11 .pt models
-    ULTRA_AVAILABLE = True
-except Exception as e:
-    st.warning(f"Ultralytics not available: {e}. Upload a .pt requires Ultralytics. "
-               "If you're on Streamlit Cloud and this fails, add runtime.txt (python-3.11.9).")
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def pil_to_rgb(img: Image.Image) -> np.ndarray:
-    """PIL -> RGB numpy uint8"""
-    return np.array(img.convert("RGB"))
-
-def draw_boxes(img_bgr: np.ndarray,
-               boxes: List[List[int]],
-               classes: List[int],
-               scores: List[float],
-               class_names: List[str]) -> np.ndarray:
-    """Overlay rectangles + labels."""
-    vis = img_bgr.copy()
-    for (x1, y1, x2, y2), cls, score in zip(boxes, classes, scores):
-        name = class_names[cls] if 0 <= cls < len(class_names) else str(cls)
-        color = (0, 255, 0)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(vis, f"{name} {score:.2f}", (x1, max(0, y1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-    return vis
-
-def parse_ultra_result(res) -> Dict[str, Any]:
-    """
-    Parse one Ultralytics result object → {'boxes','classes','scores'}.
-    Compatible with YOLOv8/11 Results.
-    """
-    out = {"boxes": [], "classes": [], "scores": []}
-    if res is None or getattr(res, "boxes", None) is None:
-        return out
-    b = res.boxes
-    xyxy = b.xyxy.cpu().numpy().astype(int).tolist()
-    cls = b.cls.cpu().numpy().astype(int).tolist()
-    conf = b.conf.cpu().numpy().astype(float).tolist()
-    out["boxes"], out["classes"], out["scores"] = xyxy, cls, conf
-    return out
-
-def zip_in_memory(file_tuples: List[Tuple[str, bytes]]) -> io.BytesIO:
-    """Create and return a ZIP (in memory)."""
-    import zipfile
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for zpath, data in file_tuples:
-            zf.writestr(zpath, data)
-    buf.seek(0)
-    return buf
-
-# ---------------------------
-# Sidebar: Settings
-# ---------------------------
-st.sidebar.title("Settings")
-
-# Model source
-model_choice = st.sidebar.radio("Select YOLO weight file", ["Use demo model (models/best.pt)", "Upload your model (.pt)"])
-
-# Confidence
-confidence = st.sidebar.slider("Confidence", min_value=0.05, max_value=1.0, value=0.45, step=0.05)
-iou_thres  = st.sidebar.slider("IoU (NMS)", min_value=0.10, max_value=0.95, value=0.45, step=0.05)
-imgsz      = st.sidebar.selectbox("imgsz (inference size)", [640, 512, 416], index=0)
-
-# Device (Ultralytics will pick CPU if CUDA unavailable)
-device = "cuda" if ULTRA_AVAILABLE and hasattr(cv2, "cuda") else "cpu"
-device = st.sidebar.selectbox("Device", ["cpu", "cuda"], index=0 if device == "cpu" else 1)
-
-# Class names override (optional)
-class_names_str = st.sidebar.text_area("Class names (comma-separated) — optional", "hotspot, crack, delamination")
-user_class_names = [s.strip() for s in class_names_str.split(",") if s.strip()]
-
-# Class filter
-use_class_filter = st.sidebar.checkbox("Filter classes for display", False)
-filter_classes = []
-if use_class_filter and user_class_names:
-    filter_classes = st.sidebar.multiselect("Select classes to show", user_class_names, default=user_class_names)
-
-# Input type & source
-input_option = st.sidebar.radio("Select input type", ["image", "video"])
-data_src     = st.sidebar.radio("Select input source", ["Sample data", "Upload your own data"])
-
-# ---------------------------
-# Load model
-# ---------------------------
-ultra_model = None
-model_path = None
-
-if model_choice == "Upload your model (.pt)":
-    if not ULTRA_AVAILABLE:
-        st.error("Ultralytics not installed. You cannot load .pt here. Add runtime.txt (python-3.11.9) and ultralytics in requirements, or use ONNX path.")
+def parse_selected_classes(selected_names, model_names):
+    """Map selected class names to indices."""
+    if selected_names is None or len(selected_names) == 0:
+        return None
+    # Build name->index map
+    if isinstance(model_names, dict):
+        name_to_idx = {v: k for k, v in model_names.items()}
     else:
-        model_bytes = st.sidebar.file_uploader("Upload a YOLO .pt model", type=["pt"])
-        if model_bytes:
-            model_path = Path("models") / model_bytes.name
-            model_path.write_bytes(model_bytes.read())
-            try:
-                ultra_model = YOLO(str(model_path))
-                st.sidebar.success(f"Loaded model: {model_path.name}")
-            except Exception as e:
-                st.sidebar.error(f"Failed to load .pt: {e}")
-else:
-    # Demo model path
-    model_path = Path("models/best.pt")
-    if model_path.exists() and ULTRA_AVAILABLE:
-        try:
-            ultra_model = YOLO(str(model_path))
-            st.sidebar.success(f"Loaded demo model: {model_path.name}")
-        except Exception as e:
-            st.sidebar.error(f"Failed to load demo model: {e}")
-    else:
-        st.sidebar.info("Place your demo weight at 'models/best.pt' to use this option.")
+        name_to_idx = {v: i for i, v in enumerate(model_names)}
+    indices = []
+    for name in selected_names:
+        if name in name_to_idx:
+            indices.append(name_to_idx[name])
+        else:
+            st.warning(f"Class name '{name}' not found in model.names")
+    return sorted(set(indices)) if indices else None
 
-# Determine class names
-class_names: List[str] = []
-if ultra_model is not None:
-    # Ultralytics model.names is a dict {id: name}
-    names_dict = getattr(ultra_model, "names", None) or {}
-    class_names = [names_dict[i] for i in sorted(names_dict.keys())] if names_dict else []
-# Override with user-specified names if provided
-if user_class_names:
-    class_names = user_class_names
 
-if ultra_model is not None:
-    st.info(f"Model classes: {len(class_names) if class_names else '(unknown)'} — {class_names if class_names else '(no names provided)'}")
+@st.cache_resource(show_spinner=True)
+def load_yolov5_model(weights_path, repo_dir=None, device=None):
+    """Load YOLOv5 custom model. Uses local repo if provided; else tries torch.hub."""
+    dev = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        if repo_dir and os.path.isdir(repo_dir):
+            model = torch.hub.load(repo_dir, "custom", path=weights_path, source="local", trust_repo=True)
+        else:
+            model = torch.hub.load("ultralytics/yolov5", "custom", path=weights_path, trust_repo=True)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load YOLOv5 model. If offline, set 'YOLOv5 repo (local)' to a local clone.
+"
+            f"Original error: {e}"
+        )
+    model.to(dev)
+    model.eval()
+    return model, dev
 
-# ---------------------------
-# Inference helpers
-# ---------------------------
-def run_ultralytics_image(rgb_arr: np.ndarray) -> Tuple[np.ndarray, Dict[str, int]]:
-    """Run Ultralytics on a single RGB image → overlay RGB + per-class counts."""
-    results = ultra_model.predict(
-        source=rgb_arr,
-        imgsz=int(imgsz),
-        conf=confidence,
-        iou=iou_thres,
-        device=device,
-        verbose=False
-    )
-    res = results[0]
-    parsed = parse_ultra_result(res)
 
-    # Optional class filter
-    if filter_classes and class_names:
-        keep = []
-        for k, cid in enumerate(parsed["classes"]):
-            cname = class_names[cid] if 0 <= cid < len(class_names) else str(cid)
-            if cname in filter_classes:
-                keep.append(k)
-        parsed["boxes"]   = [parsed["boxes"][k]   for k in keep]
-        parsed["classes"] = [parsed["classes"][k] for k in keep]
-        parsed["scores"]  = [parsed["scores"][k]  for k in keep]
-
-    bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
-    vis_bgr = draw_boxes(bgr, parsed["boxes"], parsed["classes"], parsed["scores"], class_names)
-    vis_rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
-
-    # Counts
-    counts: Dict[str, int] = {}
-    for cid in parsed["classes"]:
-        cname = class_names[cid] if 0 <= cid < len(class_names) else str(cid)
-        counts[cname] = counts.get(cname, 0) + 1
-    return vis_rgb, counts
-
-# ---------------------------
-# Image input handler
-# ---------------------------
-def image_input_handler():
-    # Get image
-    if data_src == "Sample data":
-        img_paths = sorted(glob.glob("data/sample_images/*"))
-        if not img_paths:
-            st.warning("No sample images found in 'data/sample_images'. Please upload your own.")
-            return
-        idx = st.slider("Select a test image", min_value=1, max_value=len(img_paths), value=1, step=1)
-        img_file = img_paths[idx - 1]
-        rgb = pil_to_rgb(Image.open(img_file))
-    else:
-        img_bytes = st.file_uploader("Upload an image", type=['png', 'jpeg', 'jpg', 'bmp', 'tif', 'tiff'])
-        if not img_bytes:
-            st.info("Upload an image to run inference.")
-            return
-        ext = img_bytes.name.split('.')[-1]
-        img_file = f"data/uploaded_data/upload.{ext}"
-        Image.open(img_bytes).save(img_file)
-        rgb = pil_to_rgb(Image.open(img_file))
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(rgb, caption="Selected Image", use_column_width=True)
-
-    with col2:
-        if ultra_model is None:
-            st.error("Model not loaded. Please upload/select a YOLO .pt model.")
-            return
-        vis_rgb, counts = run_ultralytics_image(rgb)
-        st.image(vis_rgb, caption="Model Prediction", use_column_width=True)
-        st.json({"detections_per_class": counts})
-
-# ---------------------------
-# Video input handler
-# ---------------------------
-def video_input_handler():
-    # Get video
-    if data_src == "Sample data":
-        sample_vid = "data/sample_videos/sample.mp4"
-        if not Path(sample_vid).exists():
-            st.warning("No sample video found in 'data/sample_videos/sample.mp4'. Please upload your own.")
-            return
-        vid_file = sample_vid
-    else:
-        vid_bytes = st.file_uploader("Upload a video", type=['mp4', 'mpv', 'avi', 'mov', 'mkv'])
-        if not vid_bytes:
-            st.info("Upload a video to run inference.")
-            return
-        ext = vid_bytes.name.split('.')[-1]
-        vid_file = f"data/uploaded_data/upload.{ext}"
-        with open(vid_file, 'wb') as out:
-            out.write(vid_bytes.read())
-
-    cap = cv2.VideoCapture(vid_file)
-    if not cap.isOpened():
-        st.error("Cannot open video.")
-        return
-
-    # Custom size (optional)
-    custom_size = st.sidebar.checkbox("Custom frame size")
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if custom_size:
-        width = st.sidebar.number_input("Width", min_value=120, step=20, value=width)
-        height = st.sidebar.number_input("Height", min_value=120, step=20, value=height)
-
-    fps_live = 0.0
-    st1, st2, st3 = st.columns(3)
-    with st1:
-        st.markdown("## Height"); st1_text = st.markdown(f"{height}")
-    with st2:
-        st.markdown("## Width");  st2_text = st.markdown(f"{width}")
-    with st3:
-        st.markdown("## FPS");    st3_text = st.markdown(f"{fps_live:.2f}")
-
-    st.markdown("---")
-    output = st.empty()
-    prev_time = time.time()
-
-    # Writer
-    out_dir = Path("output") / Path(vid_file).stem
+def run_inference_on_image(model, img_path, out_dir, imgsz):
+    """Run inference and save annotated image + CSV."""
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_mp4 = out_dir / "overlay.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    fps_out = cap.get(cv2.CAP_PROP_FPS) or 25
-    writer = cv2.VideoWriter(str(out_mp4), fourcc, fps_out, (int(width), int(height)))
+    results = model(str(img_path), size=int(imgsz))
 
-    processed_frames = 0
-    while True:
-        ret, frame_bgr = cap.read()
-        if not ret:
-            st.write("Stream ended.")
-            break
-        frame_bgr = cv2.resize(frame_bgr, (int(width), int(height)))
+    # Save annotated image
+    try:
+        results.save(save_dir=str(out_dir))
+    except TypeError:
+        # Fallback manual render
+        results.render()
+        im = results.ims[0]  # BGR np array
+        stem = Path(img_path).stem
+        out_path = out_dir / f"{stem}.jpg"
+        cv2.imwrite(str(out_path), im)
 
-        if ultra_model is None:
-            st.error("Model not loaded. Please upload/select a YOLO .pt model.")
-            break
+    # Save CSV
+    try:
+        df = results.pandas().xyxy[0]
+        stem = Path(img_path).stem
+        (out_dir / f"{stem}.csv").write_text(df.to_csv(index=False))
+    except Exception as e:
+        warnings.warn(f"Could not save detection CSV: {e}")
 
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        vis_rgb, _counts = run_ultralytics_image(rgb)
-        vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+    return results
 
-        output.image(vis_rgb, use_column_width=True)
-        writer.write(vis_bgr)
 
-        curr_time = time.time()
-        fps_live = 1.0 / max(1e-6, (curr_time - prev_time))
-        prev_time = curr_time
+#############################
+# Streamlit UI              #
+#############################
 
-        st1_text.markdown(f"**{int(height)}**")
-        st2_text.markdown(f"**{int(width)}**")
-        st3_text.markdown(f"**{fps_live:.2f}**")
+st.set_page_config(page_title="EL Defect Detection (YOLOv5)", layout="wide")
 
-        processed_frames += 1
+st.title("EL Defect Detection using YOLOv5 (best.pt)")
+st.write(
+    "Upload EL images and a trained YOLOv5 weights file (best.pt). Configure confidence, IOU, and classes, "
+    "then run detection. Annotated images and CSVs will be saved to an output folder."
+)
 
-    cap.release()
-    writer.release()
+with st.sidebar:
+    st.header("Model & Settings")
+    weights_upload = st.file_uploader("Upload YOLOv5 weights (.pt)", type=["pt"], accept_multiple_files=False)
+    repo_dir = st.text_input(
+        "YOLOv5 repo (local)",
+        help=(
+            "Optional: local path to cloned YOLOv5 repo (e.g., ./yolov5). "
+            "Use this if you're in an offline environment."
+        ),
+        value=""
+    )
+    device_choice = st.selectbox("Device", options=["auto", "cpu", "cuda"], index=0)
 
-    st.success(f"Processed {processed_frames} frames")
-    st.video(str(out_mp4))
+    conf_thres = st.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
+    iou_thres = st.slider("NMS IoU threshold", 0.0, 1.0, 0.45, 0.01)
+    imgsz = st.number_input("Image size (pixels)", min_value=320, max_value=4096, value=1280, step=64)
+    max_det = st.number_input("Max detections", min_value=1, max_value=10000, value=1000, step=10)
+    agnostic_nms = st.checkbox("Agnostic NMS", value=False)
 
-# ---------------------------
-# Router
-# ---------------------------
-if input_option == "image":
-    image_input_handler()
-else:
-    video_input_handler()
+    out_root = st.text_input("Output root folder", value="./runs/el_streamlit")
+
+st.divider()
+
+st.subheader("Upload EL images")
+uploaded_images = st.file_uploader(
+    "Upload one or more EL images", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"], accept_multiple_files=True
+)
+
+run_btn = st.button("Run Detection", type="primary")
+
+model = None
+model_names = None
+model_device = None
+weights_path = None
+
+if weights_upload is not None:
+    weights_path = save_uploaded_file(weights_upload)
+
+if run_btn:
+    if weights_path is None:
+        st.error("Please upload a YOLOv5 weights file (best.pt) to proceed.")
+        st.stop()
+    if uploaded_images is None or len(uploaded_images) == 0:
+        st.error("Please upload at least one EL image.")
+        st.stop()
+
+    # Load model
+    try:
+        repo_arg = repo_dir if repo_dir.strip() else None
+        device_arg = None if device_choice == "auto" else device_choice
+        with st.spinner("Loading YOLOv5 model..."):
+            model, model_device = load_yolov5_model(weights_path, repo_arg, device_arg)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    model.conf = float(conf_thres)
+    model.iou = float(iou_thres)
+    model.max_det = int(max_det)
+    model.agnostic = bool(agnostic_nms)
+
+    st.success(f"Model loaded on device: {model_device}")
+
+    # Class selection UI
+    model_names = model.names
+    if isinstance(model_names, dict):
+        cls_display = [model_names[i] for i in sorted(model_names.keys())]
+    else:
+        cls_display = list(model_names)
+    selected_cls_names = st.multiselect("Select classes to detect (optional)", options=cls_display)
+    selected_cls_indices = parse_selected_classes(selected_cls_names, model_names)
+
+    # Prepare output directory
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(out_root) / f"run_{ts}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save run config
+    cfg = {
+        "weights": weights_upload.name if weights_upload else None,
+        "repo_dir": repo_dir,
+        "device": model_device,
+        "conf": conf_thres,
+        "iou": iou_thres,
+        "imgsz": imgsz,
+        "max_det": max_det,
+        "agnostic_nms": agnostic_nms,
+        "selected_classes": selected_cls_names,
+        "out_dir": str(out_dir),
+    }
+    (out_dir / "run_config.json").write_text(json.dumps(cfg, indent=2))
+
+    # Apply class filter to model
+    model.classes = selected_cls_indices if selected_cls_indices is not None else None
+
+    # Process images
+    cols = st.columns(2)
+    left, right = cols
+
+    results_summary = []
+    for i, upl in enumerate(uploaded_images):
+        st.write("")
+        with st.spinner(f"Processing image {i+1}/{len(uploaded_images)}: {upl.name}"):
+            img_path = save_uploaded_file(upl, suffix="")
+            res = run_inference_on_image(model, img_path, out_dir, imgsz=int(imgsz))
+
+            # Display annotated image if present
+            stem = Path(img_path).stem
+            annotated_path = None
+            # YOLOv5 saves annotated image under out_dir / original_filename
+            candidate = Path(out_dir) / upl.name
+            if candidate.exists():
+                annotated_path = candidate
+            else:
+                # fallback: stem.jpg
+                alt = Path(out_dir) / f"{stem}.jpg"
+                if alt.exists():
+                    annotated_path = alt
+
+            if annotated_path and annotated_path.exists():
+                img = Image.open(annotated_path)
+                left.image(img, caption=f"Annotated: {upl.name}", use_column_width=True)
+            else:
+                st.warning("Annotated image not found; check output folder.")
+
+            # Show table of detections
+            try:
+                df = res.pandas().xyxy[0]
+                right.dataframe(df, use_container_width=True)
+                results_summary.append({"image": upl.name, "detections": len(df)})
+            except Exception as e:
+                st.warning(f"No detections table available: {e}")
+
+    st.success(f"Completed. Outputs saved to: {out_dir}")
+
+    # Zip download
+    try:
+        import shutil
+        zip_path = str(out_dir) + ".zip"
+        shutil.make_archive(str(out_dir), "zip", str(out_dir))
+        with open(zip_path, "rb") as f:
+            st.download_button(
+                label="Download all outputs (ZIP)",
+                data=f,
+                file_name=os.path.basename(zip_path),
+                mime="application/zip",
+            )
+    except Exception as e:
+        st.warning(f"Could not create ZIP: {e}")
+
+    # Summary
+    if results_summary:
+        st.subheader("Detection summary")
+        st.table(pd.DataFrame(results_summary))
+
