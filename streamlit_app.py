@@ -325,4 +325,3 @@ if input_option == "image":
     image_input_handler()
 else:
     video_input_handler()
-``
